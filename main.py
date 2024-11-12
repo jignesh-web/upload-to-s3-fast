@@ -9,10 +9,9 @@ import asyncio
 from datetime import datetime
 import logging
 from botocore.exceptions import ClientError
-import shutil
+import aiofiles
 import tempfile
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -36,66 +35,75 @@ s3 = boto3.client(
 )
 
 BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB limit
 MAX_CONCURRENT_UPLOADS = 3
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
-
 upload_status = {}
 
-async def save_upload_file_tmp(upload_file: UploadFile) -> str:
-    """Save upload file temporarily and return its path"""
+def upload_file_to_s3(file_path: str, s3_key: str, content_type: str):
     try:
-        suffix = os.path.splitext(upload_file.filename)[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            shutil.copyfileobj(upload_file.file, tmp)
-            return tmp.name
-    finally:
-        upload_file.file.close()
+        s3.upload_file(
+            file_path,
+            BUCKET_NAME,
+            s3_key,
+            ExtraArgs={"ContentType": content_type}
+        )
+        return True
+    except Exception as e:
+        logger.error(f"S3 upload error: {str(e)}")
+        raise e
 
-async def upload_to_s3(file: UploadFile, upload_id: str):
-    temp_file_path = None
+async def process_upload(file: UploadFile, upload_id: str):
+    temp_file = None
     try:
         async with upload_semaphore:
-            # Save file to temp location
-            temp_file_path = await save_upload_file_tmp(file)
-            
+            # Create a temporary file
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                # Read content from UploadFile and write to temp file
+                content = await file.read()
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+
             upload_status[upload_id]['files'][file.filename] = {
                 'status': 'uploading',
                 'start_time': datetime.now().isoformat()
             }
-            
-            # Upload using the temp file
-            with open(temp_file_path, 'rb') as file_data:
-                await asyncio.to_thread(
-                    s3.upload_fileobj,
-                    file_data,
-                    BUCKET_NAME,
-                    f"{upload_id}/{file.filename}",
-                    ExtraArgs={"ContentType": file.content_type}
-                )
-            
-            upload_status[upload_id]['files'][file.filename].update({
-                'status': 'completed',
-                'end_time': datetime.now().isoformat()
-            })
-            logger.info(f"Successfully uploaded {file.filename}")
-            
+
+            # Upload to S3 using the temporary file
+            s3_key = f"{upload_id}/{file.filename}"
+            success = await asyncio.to_thread(
+                upload_file_to_s3,
+                temp_file_path,
+                s3_key,
+                file.content_type or 'application/octet-stream'
+            )
+
+            if success:
+                upload_status[upload_id]['files'][file.filename].update({
+                    'status': 'completed',
+                    'end_time': datetime.now().isoformat()
+                })
+                logger.info(f"Successfully uploaded {file.filename}")
+
     except Exception as e:
         logger.error(f"Error uploading {file.filename}: {str(e)}")
-        upload_status[upload_id]['files'][file.filename] = {
+        upload_status[upload_id]['files'][file.filename].update({
             'status': 'failed',
             'error': str(e),
             'end_time': datetime.now().isoformat()
-        }
+        })
+
     finally:
-        # Clean up temp file
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
+        # Clean up the temporary file
+        try:
+            if temp_file:
+                os.unlink(temp_file.name)
+        except Exception as e:
+            logger.error(f"Error cleaning up temporary file: {str(e)}")
 
 @app.post("/upload/")
 async def upload_files(
-    background_tasks: BackgroundTasks,
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     upload_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     
@@ -104,12 +112,12 @@ async def upload_files(
         'start_time': datetime.now().isoformat(),
         'files': {}
     }
-    
+
     for file in files:
         if not file.filename:
             continue
-        background_tasks.add_task(upload_to_s3, file, upload_id)
-    
+        background_tasks.add_task(process_upload, file, upload_id)
+
     return JSONResponse({
         "message": f"Processing {len(files)} files",
         "upload_id": upload_id,
