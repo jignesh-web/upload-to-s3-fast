@@ -9,6 +9,8 @@ import asyncio
 from datetime import datetime
 import logging
 from botocore.exceptions import ClientError
+import shutil
+import tempfile
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +20,6 @@ load_dotenv()
 
 app = FastAPI(title="Bulk S3 Uploader")
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,7 +28,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize S3 client
 s3 = boto3.client(
     's3',
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
@@ -37,57 +37,60 @@ s3 = boto3.client(
 
 BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB limit
-MAX_CONCURRENT_UPLOADS = 3  # Limit concurrent uploads
+MAX_CONCURRENT_UPLOADS = 3
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 
-# In-memory storage for upload status
 upload_status = {}
 
-async def upload_to_s3(file: UploadFile, upload_id: str):
+async def save_upload_file_tmp(upload_file: UploadFile) -> str:
+    """Save upload file temporarily and return its path"""
     try:
-        async with upload_semaphore:  # Control concurrent uploads
-            if file.size > MAX_FILE_SIZE:
-                raise HTTPException(status_code=400, detail=f"File {file.filename} exceeds 50MB limit")
+        suffix = os.path.splitext(upload_file.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(upload_file.file, tmp)
+            return tmp.name
+    finally:
+        upload_file.file.close()
+
+async def upload_to_s3(file: UploadFile, upload_id: str):
+    temp_file_path = None
+    try:
+        async with upload_semaphore:
+            # Save file to temp location
+            temp_file_path = await save_upload_file_tmp(file)
             
-            # Update status to uploading
             upload_status[upload_id]['files'][file.filename] = {
                 'status': 'uploading',
                 'start_time': datetime.now().isoformat()
             }
             
-            # Stream file to S3 in chunks to minimize memory usage
-            try:
+            # Upload using the temp file
+            with open(temp_file_path, 'rb') as file_data:
                 await asyncio.to_thread(
                     s3.upload_fileobj,
-                    file.file,
+                    file_data,
                     BUCKET_NAME,
                     f"{upload_id}/{file.filename}",
                     ExtraArgs={"ContentType": file.content_type}
                 )
-                
-                # Update success status
-                upload_status[upload_id]['files'][file.filename].update({
-                    'status': 'completed',
-                    'end_time': datetime.now().isoformat()
-                })
-                
-            except ClientError as e:
-                logger.error(f"S3 upload error for {file.filename}: {str(e)}")
-                upload_status[upload_id]['files'][file.filename].update({
-                    'status': 'failed',
-                    'error': str(e),
-                    'end_time': datetime.now().isoformat()
-                })
-                
+            
+            upload_status[upload_id]['files'][file.filename].update({
+                'status': 'completed',
+                'end_time': datetime.now().isoformat()
+            })
+            logger.info(f"Successfully uploaded {file.filename}")
+            
     except Exception as e:
-        logger.error(f"Unexpected error for {file.filename}: {str(e)}")
-        upload_status[upload_id]['files'][file.filename].update({
+        logger.error(f"Error uploading {file.filename}: {str(e)}")
+        upload_status[upload_id]['files'][file.filename] = {
             'status': 'failed',
             'error': str(e),
             'end_time': datetime.now().isoformat()
-        })
+        }
     finally:
-        await file.close()
+        # Clean up temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
 
 @app.post("/upload/")
 async def upload_files(
@@ -96,15 +99,15 @@ async def upload_files(
 ):
     upload_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # Initialize upload status
     upload_status[upload_id] = {
         'total_files': len(files),
         'start_time': datetime.now().isoformat(),
         'files': {}
     }
     
-    # Queue uploads in background
     for file in files:
+        if not file.filename:
+            continue
         background_tasks.add_task(upload_to_s3, file, upload_id)
     
     return JSONResponse({
