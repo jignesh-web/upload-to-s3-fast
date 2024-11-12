@@ -3,3 +3,4 @@ python-multipart
 uvicorn
 boto3
 python-dotenv
+aiofiles==23.2.1
